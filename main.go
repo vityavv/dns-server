@@ -26,12 +26,76 @@ func main() {
 		buf = buf[:n]
 		header, questions, answers, authorities, additionalRecords, err := parsePacket(buf)
 		fmt.Printf("Header: %#v\nQuestions: %#v\nAnswers: %#v\nAuthorities: %#v\nAdditional Records: %#v\n", header, questions, answers, authorities, additionalRecords)
+
+		//let's just hard-code this one in: 199.7.91.13 (d.root-servers.net)
+		// ROOT_SERVER := "199.7.91.13"
+		//ROOT_SERVER := binary.BigEndian.Uint32([]byte{199, 7, 91, 13})
+		ROOT_SERVER := []byte{199, 7, 91, 13} //has to be like this for Rdata field.
+
+		if header.Opcode != QUERY {
+			panic("Found a non-query opcode and I don't know what to do (TODO)")
+		}
+
+		//start crafting response
+		rHeader := Header{
+			Id:      header.Id,
+			Qr:      true,
+			Opcode:  QUERY,
+			Aa:      false,
+			Tc:      false,
+			Rd:      header.Rd,
+			Ra:      true,  //technically no, TODO
+			Ad:      false, //TODO, figure out what this means https://tools.ietf.org/html/rfc4035#section-3.2.3 (probably ok to keep it 0 because older RFCs didn't have it)
+			Cd:      header.Cd,
+			Qdcount: header.Qdcount, //copying question section from query to response
+		}
+		rQuestions := questions
+		//Fields left out: Rcode, Ancount, Nscount, Arcount
+		if !header.Rd { //they don't want recursion
+			rHeader.Rcode = NO_ERR
+			rHeader.Ancount = 0
+			rHeader.Nscount = 1 //This is where our root server goes. TODO: when you get to the cache, make this more complex than just sending the root server i.e. remember other authorities
+			rHeader.Arcount = 1
+			rAnswers := []ResourceRecord{}
+			convertedDomain := convertToDomainName([]string{"d", "root-servers", "net"})
+			rAuthorities := []ResourceRecord{ResourceRecord{
+				Name:     []string{},
+				Type:     NS,
+				Class:    1, //INternet
+				Ttl:      3600000,
+				Rdlength: uint16(len(convertedDomain)),
+				Rdata:    convertedDomain,
+			}}
+			rAdditionalRecords := []ResourceRecord{ResourceRecord{
+				Name:     []string{"d", "root-servers", "net"},
+				Type:     A,
+				Class:    1,
+				Ttl:      3600000,
+				Rdlength: 4,
+				Rdata:    ROOT_SERVER,
+			}}
+			fmt.Printf("===RESPONSE===\nHeader: %#v\nQuestions: %#v\nAnswers: %#v\nAuthorities: %#v\nAdditional Records: %#v\n", rHeader, rQuestions, rAnswers, rAuthorities, rAdditionalRecords)
+			responsePacket := packetify(rHeader, rQuestions, rAnswers, rAuthorities, rAdditionalRecords)
+			udpConn.WriteTo(responsePacket, udpAddr)
+		} else {
+			panic("Not implemented feature reached")
+		}
+
 		// Below is the code to return an answer
 		// go func(pc net.PacketConn, addr net.Addr, buf []byte) {
 		// buf[2] |= 0x80        //what is a QR bit?
 		// pc.WriteTo(buf, addr) //writes from buf to addr
 		// }(pc, addr, buf[:n])
 	}
+}
+
+func convertToDomainName(name []string) (result []byte) {
+	for _, s := range name {
+		result = append(result, byte(len(s)))
+		result = append(result, []byte(s)...)
+	}
+	result = append(result, 0)
+	return
 }
 
 type Opcode int
@@ -77,13 +141,35 @@ type Question struct {
 	Qclass uint16
 }
 
+type TYPE uint16
+
+const (
+	A     = iota + 1 //host address
+	NS               // authoritative name server
+	MD               //obsolete mail destination
+	MF               //obsolete mail forwarder
+	CNAME            //canonical name for alias
+	SOA              //start of a zone of authority
+	MB               //mailbox domain name
+	MG               //mail group member
+	MR               //mail rename domain name
+	NULL
+	WKS   //well known service desc.
+	PTR   //domain name pointer
+	HINFO // host information
+	MINFO //mailbox/mail list information
+	MX    //mail exchange
+	TXT   //text strings
+	//TODO find more
+)
+
 type ResourceRecord struct {
 	Name     []string
-	Type     uint16
+	Type     TYPE
 	Class    uint16
 	Ttl      uint32
 	Rdlength uint16
-	Rdata    string
+	Rdata    []byte
 }
 
 func parsePacket(packet []byte) (header Header, questions []Question, answers []ResourceRecord, authorities []ResourceRecord, additionalRecords []ResourceRecord, err error) {
@@ -158,14 +244,75 @@ func parseRR(packet []byte, ipos int, count int) (records []ResourceRecord, pos 
 	for q := 0; q < count; q++ {
 		newRR := ResourceRecord{Name: []string{}}
 		newRR.Name, pos = getName(packet, pos)
-		newRR.Type = binary.BigEndian.Uint16(packet[pos : pos+2])
+		newRR.Type = TYPE(binary.BigEndian.Uint16(packet[pos : pos+2]))
 		newRR.Class = binary.BigEndian.Uint16(packet[pos+2 : pos+4])
 		newRR.Ttl = binary.BigEndian.Uint32(packet[pos+4 : pos+8])
 		newRR.Rdlength = binary.BigEndian.Uint16(packet[pos+8 : pos+10])
 		pos += 10
-		newRR.Rdata = string(packet[pos : pos+int(newRR.Rdlength)])
+		newRR.Rdata = packet[pos : pos+int(newRR.Rdlength)]
 		pos += int(newRR.Rdlength)
 		records = append(records, newRR)
+	}
+	return
+}
+
+// hate that I have to do this SMH
+func bint(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func packetify(header Header, questions []Question, answers []ResourceRecord, authorities []ResourceRecord, additionalRecords []ResourceRecord) (packet []byte) {
+	//to unpack numbers into []bytes, the binary package requires that the []byte be passed to the function instead of returning a []byte
+	//I don't know why, but here are some containers for numbers that I can put the numbers into before appending that to the packet.
+	uint16cont := make([]byte, 2)
+
+	//HEADER
+	binary.BigEndian.PutUint16(uint16cont, header.Id)
+	packet = append(packet, uint16cont...)
+	packet = append(packet, byte((bint(header.Qr)<<7)+(int(header.Opcode)<<3)+(bint(header.Aa)<<2)+(bint(header.Tc)<<1)+bint(header.Rd)))
+	//reserved bit between Ra and Ad
+	packet = append(packet, byte((bint(header.Ra)<<7)+(bint(header.Ad)<<5)+(bint(header.Cd)<<4)+int(header.Rcode)))
+	binary.BigEndian.PutUint16(uint16cont, header.Qdcount)
+	packet = append(packet, uint16cont...)
+	binary.BigEndian.PutUint16(uint16cont, header.Ancount)
+	packet = append(packet, uint16cont...)
+	binary.BigEndian.PutUint16(uint16cont, header.Nscount)
+	packet = append(packet, uint16cont...)
+	binary.BigEndian.PutUint16(uint16cont, header.Arcount)
+	packet = append(packet, uint16cont...)
+
+	//QUESTION
+	for _, question := range questions {
+		packet = append(packet, convertToDomainName(question.Qname)...)
+		binary.BigEndian.PutUint16(uint16cont, question.Qtype)
+		packet = append(packet, uint16cont...)
+		binary.BigEndian.PutUint16(uint16cont, question.Qclass)
+		packet = append(packet, uint16cont...)
+	}
+
+	packet = append(packet, packetifyRR(answers)...)
+	packet = append(packet, packetifyRR(authorities)...)
+	packet = append(packet, packetifyRR(additionalRecords)...)
+	return
+}
+
+func packetifyRR(rrs []ResourceRecord) (packet []byte) {
+	uint16cont := make([]byte, 2)
+	uint32cont := make([]byte, 4)
+	for _, rr := range rrs {
+		packet = append(packet, convertToDomainName(rr.Name)...)
+		binary.BigEndian.PutUint16(uint16cont, uint16(rr.Type))
+		packet = append(packet, uint16cont...)
+		binary.BigEndian.PutUint16(uint16cont, rr.Class)
+		packet = append(packet, uint16cont...)
+		binary.BigEndian.PutUint32(uint32cont, rr.Ttl)
+		packet = append(packet, uint32cont...)
+		binary.BigEndian.PutUint16(uint16cont, rr.Rdlength)
+		packet = append(packet, uint16cont...)
+		packet = append(packet, rr.Rdata...)
 	}
 	return
 }
